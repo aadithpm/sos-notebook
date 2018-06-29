@@ -26,7 +26,9 @@ from IPython.core.error import UsageError
 from IPython.lib.clipboard import (ClipboardEmpty, osx_clipboard_get,
                                    tkinter_clipboard_get)
 from IPython.utils.tokenutil import line_at_cursor, token_at_cursor
-from jupyter_client import find_connection_file, manager
+from jupyter_client import find_connection_file
+from jupyter_client.multikernelmanager import MultiKernelManager
+
 from sos._version import __sos_version__, __version__
 from sos.eval import SoS_eval, SoS_exec, interpolate
 from sos.syntax import SOS_GLOBAL_SECTION_HEADER, SOS_SECTION_HEADER
@@ -925,7 +927,6 @@ class SoS_Kernel(IPythonKernel):
         # 'sos.R.sos_R' is the language module.
         # '#FFEEAABB' is the background color
         #
-        self.kernels = {}
         # self.shell = InteractiveShell.instance()
         self.format_obj = self.shell.display_formatter.format
 
@@ -939,6 +940,7 @@ class SoS_Kernel(IPythonKernel):
         self._execution_count = 1
         self._debug_mode = False
         self.frontend_comm = None
+        self.kernels = MultiKernelManager()
         self.comm_manager.register_target('sos_comm', self.sos_comm)
         self.my_tasks = {}
         self.last_executed_code = ''
@@ -1073,7 +1075,7 @@ class SoS_Kernel(IPythonKernel):
         #
         cur_kernel = self.kernel
         try:
-            for kernel in self.kernels.keys():
+            for kernel in self.kernels.list_kernel_ids():
                 kinfo = self.subkernels.find(kernel)
                 self.switch_kernel(kernel)
                 result[kernel] = [
@@ -1380,11 +1382,13 @@ class SoS_Kernel(IPythonKernel):
         else:
             cell_kernel = self.subkernels.find(self.editor_kernel)
             try:
-                _, KC = self.kernels[cell_kernel.name]
+                KC = self.kernels.get_kernel(
+                    cell_kernel.name).client()
             except Exception as e:
                 if self._debug_mode:
                     log_to_file(f'Failed to get subkernels {cell_kernel.name}')
-                KC = self.KC
+                KC = self.kernels.get_kernel(
+                    self.kernel).client()
             try:
                 KC.inspect(code, cursor_pos)
                 while KC.shell_channel.msg_ready():
@@ -1413,11 +1417,13 @@ class SoS_Kernel(IPythonKernel):
         else:
             cell_kernel = self.subkernels.find(self.editor_kernel)
             try:
-                _, KC = self.kernels[cell_kernel.name]
+                KC = self.kernels.get_kernel(
+                    cell_kernel.name).client()
             except Exception as e:
                 if self._debug_mode:
                     log_to_file(f'Failed to get subkernels {cell_kernel.name}')
-                KC = self.KC
+                KC = self.kernels.get_kernel(
+                    self.kernel).client()
             try:
                 KC.complete(code, cursor_pos)
                 while KC.shell_channel.msg_ready():
@@ -1463,11 +1469,12 @@ class SoS_Kernel(IPythonKernel):
 
     def run_cell(self, code, silent, store_history, on_error=None):
         #
-        if not self.KM.is_alive():
+        if not self.kernels.is_alive(self.kernel):
             self.send_response(self.iopub_socket, 'stream',
                                dict(name='stdout', text='Restarting kernel "{}"\n'.format(self.kernel)))
-            self.KM.restart_kernel(now=False)
-            self.KC = self.KM.client()
+            self.kernels.restart_kernel(self.kernel, now=False)
+            self.KC = self.kernels.get_kernel(
+                self.kernel).client()
         # flush stale replies, which could have been ignored, due to missed heartbeats
         while self.KC.shell_channel.msg_ready():
             self.KC.shell_channel.get_msg()
@@ -1528,7 +1535,7 @@ class SoS_Kernel(IPythonKernel):
             self.send_response(self.iopub_socket, 'stream',
                                dict(name='stdout', text='''\
 Active subkernels: {}
-Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
+Available subkernels:\n{}'''.format(', '.join(self.kernels.list_kernel_ids()),
                                     '\n'.join(['    {} ({})'.format(x.name, x.kernel) for x in self.subkernels.kernel_list()]))))
             return
         kinfo = self.subkernels.find(kernel, kernel_name, language, color)
@@ -1570,8 +1577,18 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
             if kinfo.name not in self.kernels:
                 # start a new kernel
                 try:
-                    self.kernels[kinfo.name] = manager.start_new_kernel(
-                        startup_timeout=60, kernel_name=kinfo.kernel, cwd=os.getcwd())
+                    self.kernels.start_kernel(
+                        kernel_name=kinfo.kernel, cwd=os.getcwd(),
+                        kernel_id=kinfo.name)
+                    kc = self.kernels.get_kernel(
+                        kinfo.name).client()
+                    kc.start_channels()
+                    try:
+                        kc.wait_for_ready(timeout=60)
+                    except RuntimeError:
+                        kc.stop_channels()
+                        km.shutdown_kernel()
+                        raise
                     new_kernel = True
                 except Exception as e:
                     # try toget error message
@@ -1579,15 +1596,16 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
                     with tempfile.TemporaryFile() as ferr:
                         try:
                             # this should fail
-                            manager.start_new_kernel(
+                            self.kernels.start_kernel(
                                 startup_timeout=60, kernel_name=kinfo.kernel, cwd=os.getcwd(),
-                                stdout=subprocess.DEVNULL, stderr=ferr)
+                                kernel_id=kinfo.name, stdout=subprocess.DEVNULL, stderr=ferr)
                         except:
                             ferr.seek(0)
                             self.warn(
                                 f'Failed to start kernel "{kernel}". {e}\nError Message:\n{ferr.read().decode()}')
                     return
-            self.KM, self.KC = self.kernels[kinfo.name]
+            self.KC = self.kernels.get_kernel(
+                kinfo.name).client()
             self._kernel_return_vars = [] if ret_vars is None else ret_vars
             self.kernel = kinfo.name
             if new_kernel and self.kernel in self.supported_languages:
@@ -1611,7 +1629,8 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
                 orig_kernel = self.kernel
                 try:
                     # shutdown
-                    self.shutdown_kernel(kernel)
+                    self.kernels.shutdown_kernel(
+                        kernel, restart=True)
                     # switch back to kernel (start a new one)
                     self.switch_kernel(kernel)
                 finally:
@@ -1622,15 +1641,14 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
                 if self.kernel == kernel:
                     self.switch_kernel('SoS')
                 try:
-                    self.kernels[kernel][0].shutdown_kernel(restart=False)
+                    self.kernels.shutdown_kernel(
+                        kernel, restart=False)
                 except Exception as e:
                     self.warn(f'Failed to shutdown kernel {kernel}: {e}\n')
-                finally:
-                    self.kernels.pop(kernel)
         else:
             self.send_response(self.iopub_socket, 'stream',
                                dict(name='stdout', text='Specify one of the kernels to shutdown: SoS{}\n'
-                                    .format(''.join(f', {x}' for x in self.kernels))))
+                                    .format(''.join(f', {x}' for x in self.kernels.list_kernel_ids()))))
 
     def _parse_error(self, msg):
         self.warn(msg)
@@ -2093,7 +2111,7 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
         #
         cur_kernel = self.kernel
         try:
-            for kernel in self.kernels.keys():
+            for kernel in self.kernels.list_kernel_ids():
                 if kernel not in self.supported_languages:
                     self.warn(
                         f'Current directory of kernel {kernel} is not changed: unsupported language')
@@ -3322,7 +3340,7 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
                 return self.run_cell(code.lstrip(), silent, store_history)
             except KeyboardInterrupt:
                 self.warn('Keyboard Interrupt\n')
-                self.KM.interrupt_kernel()
+                self.kernels.interrupt_kernel(self.kernel)
                 return {'status': 'abort', 'execution_count': self._execution_count}
         else:
             if code:
@@ -3363,12 +3381,7 @@ Available subkernels:\n{}'''.format(', '.join(self.kernels.keys()),
                 env.sos_dict.pop('output', None)
 
     def do_shutdown(self, restart):
-        #
-        for name, (km, _) in self.kernels.items():
-            try:
-                km.shutdown_kernel(restart=restart)
-            except Exception as e:
-                self.warn(f'Failed to shutdown kernel {name}: {e}')
+        self.kernels.shutdown_all()
 
     def __del__(self):
         # upon releasing of sos kernel, kill all subkernels. This I thought would be
