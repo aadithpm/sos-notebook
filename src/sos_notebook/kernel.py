@@ -1330,14 +1330,9 @@ class SoS_Kernel(IPythonKernel):
     def send_frontend_msg(self, msg_type, msg=None, title='', append=False, page='Info'):
         # if comm is never created by frontend, the kernel is in test mode without frontend
         if msg_type in ('display_data', 'stream'):
-            if self._meta['use_panel'] is False:
-                if msg_type in ('display_data', 'stream'):
-                    self.send_response(self.iopub_socket, msg_type,
-                                       {} if msg is None else msg)
-            else:
-                self.frontend_comm.send(
-                    make_transient_msg(msg_type, msg, append=append, title=title, page=page),
-                    {'msg_type': 'transient_display_data'})
+            self.send_response(self.iopub_socket, 'transient_display_data',
+                   make_transient_msg(
+                       msg_type, msg, append=append, title=title, page=page))
         elif self.frontend_comm:
             self.frontend_comm.send({} if msg is None else msg, {
                                     'msg_type': msg_type})
